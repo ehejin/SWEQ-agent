@@ -14,8 +14,10 @@ from typing import Annotated, Any, Literal
 
 import litellm
 import litellm.types.utils
+from vllm_utils import get_vllm_model, generate_response
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, Field, SecretStr
+from pathlib import Path
 from swerex.exceptions import SwerexException
 from tenacity import (
     RetryCallState,
@@ -182,6 +184,26 @@ class GenericAPIModelConfig(PydanticBaseModel):
     def id(self) -> str:
         return f"{self.name}__t-{self.temperature:.2f}__p-{self.top_p:.2f}__c-{self.per_instance_cost_limit:.2f}"
 
+class VLLMModelConfig(PydanticBaseModel):
+    """Configuration for a local vLLM-backed model."""
+    name: Literal["qwen7b-vllm"] = Field(
+        default="qwen7b-vllm",
+        description="Use vLLM local inference"
+    )
+    model_path: Path = Field(
+        default="~/",
+        description="Filesystem path to the qwen2.5-32b-v0 directory or .bin"
+    )
+    max_tokens: int = Field(
+        default=2048,
+        description="Max generation length"
+    )
+    peft_dir: str | None = Field(
+        default=None,
+        description="Path to LoRA adapter dir (if using PEFT)"
+    )
+    model_config = ConfigDict(extra="forbid")
+
 
 class ReplayModelConfig(GenericAPIModelConfig):
     replay_path: Path = Field(description="Path to replay file when using the replay model.")
@@ -245,6 +267,7 @@ ModelConfig = Annotated[
     | ReplayModelConfig
     | InstantEmptySubmitModelConfig
     | HumanModelConfig
+    | VLLMModelConfig
     | HumanThoughtModelConfig,
     Field(union_mode="left_to_right"),
 ]
@@ -818,6 +841,33 @@ class LiteLLMModel(AbstractModel):
         return messages
 
 
+class VLLMModel(AbstractModel):
+    def __init__(self, cfg: VLLMModelConfig, tools):
+        self.cfg = cfg
+        self.tools = tools
+        self.llm = get_vllm_model(
+            model=str(cfg.model_path),
+            max_model_len=cfg.max_tokens,
+            enforce_eager=True,
+            num_gpus=1,
+        )
+        self.stats = InstanceStats()
+
+    def query(self, history: History, **kwargs) -> dict:
+        text = generate_response(
+            chat=history,
+            vllm_model=self.llm,
+            peft_dir=self.cfg.peft_dir,
+            model=self.cfg.name,
+            max_tokens=self.cfg.max_tokens,
+            tools=self.tools,
+            use_function_calling=self.tools.use_function_calling,
+            **kwargs
+        )[0]
+        return {"message": text}
+
+
+
 def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
     """Returns correct model object given arguments and commands"""
     # Convert GenericAPIModelConfig to specific model config if needed
@@ -833,6 +883,8 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
         elif args.name == "instant_empty_submit":
             args = InstantEmptySubmitModelConfig(**args.model_dump())
 
+    if args.name == 'vllm':
+        return VLLMModel(args, tools)
     if args.name == "human":
         assert isinstance(args, HumanModelConfig), f"Expected {HumanModelConfig}, got {args}"
         return HumanModel(args, tools)
