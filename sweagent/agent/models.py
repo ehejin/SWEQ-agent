@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal
 
 import litellm
 import litellm.types.utils
-from vllm_utils import get_vllm_model, generate_response
+from sweagent.agent.vllm_utils import get_vllm_model, generate_response
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, Field, SecretStr
 from pathlib import Path
@@ -184,7 +184,7 @@ class GenericAPIModelConfig(PydanticBaseModel):
     def id(self) -> str:
         return f"{self.name}__t-{self.temperature:.2f}__p-{self.top_p:.2f}__c-{self.per_instance_cost_limit:.2f}"
 
-class VLLMModelConfig(PydanticBaseModel):
+class VLLMModelConfig(GenericAPIModelConfig):
     """Configuration for a local vLLM-backed model."""
     name: Literal["qwen7b-vllm"] = Field(
         default="qwen7b-vllm",
@@ -263,11 +263,11 @@ class HumanThoughtModelConfig(HumanModelConfig):
 
 
 ModelConfig = Annotated[
-    GenericAPIModelConfig
+    VLLMModelConfig
+    | GenericAPIModelConfig
     | ReplayModelConfig
     | InstantEmptySubmitModelConfig
     | HumanModelConfig
-    | VLLMModelConfig
     | HumanThoughtModelConfig,
     Field(union_mode="left_to_right"),
 ]
@@ -846,10 +846,9 @@ class VLLMModel(AbstractModel):
         self.cfg = cfg
         self.tools = tools
         self.llm = get_vllm_model(
-            model=str(cfg.model_path),
+            model="Qwen/Qwen2.5-Coder-7B-Instruct",
             max_model_len=cfg.max_tokens,
-            enforce_eager=True,
-            num_gpus=1,
+            enforce_eager=True
         )
         self.stats = InstanceStats()
 
@@ -862,6 +861,9 @@ class VLLMModel(AbstractModel):
             max_tokens=self.cfg.max_tokens,
             tools=self.tools,
             use_function_calling=self.tools.use_function_calling,
+            temperature=self.cfg.temperature,
+            top_p=self.cfg.top_p,
+            stop=self.cfg.stop or None
             **kwargs
         )[0]
         return {"message": text}
@@ -883,7 +885,8 @@ def get_model(args: ModelConfig, tools: ToolConfig) -> AbstractModel:
         elif args.name == "instant_empty_submit":
             args = InstantEmptySubmitModelConfig(**args.model_dump())
 
-    if args.name == 'vllm':
+    if args.name == 'qwen7b-vllm':
+        args = VLLMModelConfig(**args.model_dump())
         return VLLMModel(args, tools)
     if args.name == "human":
         assert isinstance(args, HumanModelConfig), f"Expected {HumanModelConfig}, got {args}"

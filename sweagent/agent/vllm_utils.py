@@ -1,6 +1,9 @@
 # Python standard library
 from typing import Optional
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6"
+
 # Third party imports
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
@@ -11,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def get_vllm_model(model, max_model_len, enforce_eager=True, num_gpus=1, gpu_memory_utilization=None):
+def get_vllm_model(model, max_model_len, enforce_eager=True, num_gpus=2, gpu_memory_utilization=None):
     memory_per_model = 0.9 if gpu_memory_utilization is None else gpu_memory_utilization
     return LLM(
         model=model,
