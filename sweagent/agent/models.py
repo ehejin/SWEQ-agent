@@ -15,6 +15,7 @@ from typing import Annotated, Any, Literal
 import litellm
 import litellm.types.utils
 from sweagent.agent.vllm_utils import get_vllm_model, generate_response
+
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, Field, SecretStr
 from pathlib import Path
@@ -63,6 +64,7 @@ class RetryConfig(PydanticBaseModel):
     """Minimum wait time between retries (random exponential wait)"""
     max_wait: float = 120
     """Maximum wait time between retries (random exponential wait)"""
+
 
 
 class GenericAPIModelConfig(PydanticBaseModel):
@@ -842,31 +844,223 @@ class LiteLLMModel(AbstractModel):
 
 
 class VLLMModel(AbstractModel):
-    def __init__(self, cfg: VLLMModelConfig, tools):
+    def __init__(self, cfg: "VLLMModelConfig", tools: "ToolConfig"):
+        """
+        VLLM-based model for Qwen. Mirrors LiteLLMModel interface but uses vLLM under the hood.
+        """
         self.cfg = cfg
         self.tools = tools
-        self.llm = get_vllm_model(
-            model="Qwen/Qwen2.5-Coder-7B-Instruct",
-            max_model_len=cfg.max_tokens,
-            enforce_eager=True
-        )
-        self.stats = InstanceStats()
+        self.logger = get_logger("swea-vllm", emoji="🤖")
 
-    def query(self, history: History, **kwargs) -> dict:
-        text = generate_response(
-            chat=history,
-            vllm_model=self.llm,
-            peft_dir=self.cfg.peft_dir,
-            model=self.cfg.name,
-            max_tokens=self.cfg.max_tokens,
-            tools=self.tools,
-            use_function_calling=self.tools.use_function_calling,
-            temperature=self.cfg.temperature,
-            top_p=self.cfg.top_p,
-            stop=self.cfg.stop or None
-            **kwargs
-        )[0]
-        return {"message": text}
+        # Initialize shared vLLM instance.
+        # Use cfg.max_input_tokens as the context length for vLLM.
+
+        # Stats tracking
+        self.stats = InstanceStats()
+        self.model_max_input_tokens = 130000
+        print('max input tokens: ', cfg.max_input_tokens)
+        self.model_max_output_tokens = 130000
+
+        self.llm = get_vllm_model(
+            model='Qwen/Qwen2.5-Coder-7B-Instruct',
+            max_model_len=self.model_max_output_tokens,              # ← no more cfg.max_model_len fallback
+            enforce_eager=cfg.enforce_eager if hasattr(cfg, "enforce_eager") else True,
+            num_gpus=cfg.num_gpus if hasattr(cfg, "num_gpus") else 1,
+            gpu_memory_utilization=getattr(cfg, "gpu_memory_utilization", None),
+        )
+
+    @property
+    def instance_cost_limit(self) -> float:
+        """Cost limit for the model. Always 0 since vLLM does not track cost."""
+        return 0.0
+
+    def _update_stats(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
+        with GLOBAL_STATS_LOCK:
+            GLOBAL_STATS.total_cost += cost
+        self.stats.instance_cost += cost
+        self.stats.tokens_sent += input_tokens
+        self.stats.tokens_received += output_tokens
+        self.stats.api_calls += 1
+
+        # Log updated values
+        self.logger.debug(
+            f"input_tokens={input_tokens:,}, "
+            f"output_tokens={output_tokens:,}, "
+            f"instance_cost={self.stats.instance_cost:.2f}, "
+            f"cost={cost:.2f}"
+        )
+        self.logger.debug(
+            f"total_tokens_sent={self.stats.tokens_sent:,}, "
+            f"total_tokens_received={self.stats.tokens_received:,}, "
+            f"total_cost={GLOBAL_STATS.total_cost:.2f}, "
+            f"total_api_calls={self.stats.api_calls:,}"
+        )
+
+        # vLLM usage does not incur monetary cost; skip cost-limit checks
+        # Only enforce per-instance call limit
+        if 0 < self.cfg.per_instance_call_limit < self.stats.api_calls:
+            self.logger.warning(f"API calls {self.stats.api_calls} exceeds limit {self.cfg.per_instance_call_limit}")
+            raise InstanceCallLimitExceededError("Per instance call limit exceeded")
+
+    def _sleep(self) -> None:
+        elapsed_time = time.time() - GLOBAL_STATS.last_query_timestamp
+        if elapsed_time < self.cfg.delay:
+            time.sleep(self.cfg.delay - elapsed_time)
+        with GLOBAL_STATS_LOCK:
+            GLOBAL_STATS.last_query_timestamp = time.time()
+
+    def _single_query(
+        self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
+    ) -> list[dict]:
+        self._sleep()
+
+        # Prepare messages for vLLM
+        messages_for_vllm = [
+           {"role": m["role"], "content": m["content"]}
+           for m in messages
+       ]
+
+        # Count input tokens using litellm's tokenizer utility
+        input_tokens = litellm.utils.token_counter(messages=messages_for_vllm, model=self.cfg.name)
+        if input_tokens > self.model_max_input_tokens:
+            # Option A: raise your own ContextWindowExceededError
+            raise ContextWindowExceededError(
+                f"Prompt is {input_tokens} tokens, "
+                f"exceeds max_input_tokens={self.model_max_input_tokens}"
+            )
+        # Build generation kwargs for vLLM
+        gen_kwargs = {
+            "max_tokens": self.model_max_output_tokens,
+            "temperature": self.cfg.temperature if temperature is None else temperature,
+            "top_p": self.cfg.top_p,
+            "stop": self.cfg.stop or None,
+        }
+        # n (number of completions) is handled by vLLM via repeated calls if needed
+        # Function calling support is baked into generate_response
+
+        # Execute vLLM generation
+        try:
+            responses = generate_response(
+                chat=messages_for_vllm,
+                vllm_model=self.llm,
+                peft_dir=getattr(self.cfg, "peft_dir", None),
+                tools=self.tools.tools if self.tools.use_function_calling else None,
+                use_function_calling=self.tools.use_function_calling,
+                **gen_kwargs,
+            )
+        except Exception as e:
+            if "context length" in str(e).lower():
+                raise ContextWindowExceededError from e
+            raise
+
+        outputs: list[dict] = []
+        output_tokens = 0
+
+        for resp in responses:
+            content = resp.get("content") or ""
+            output_tokens += litellm.utils.token_counter(text=content, model=self.cfg.name)
+
+            # Build the minimal output dict that agents.py expects:
+            output_dict: dict = {"message": content}
+
+            if self.tools.use_function_calling and "function_call" in resp:
+                raw_fc = resp["function_call"]
+                # raw_fc == {"name": "<tool_name>", "arguments": "<JSONString>"}
+                output_dict["tool_calls"] = [
+                    {
+                        "id": raw_fc["name"],
+                        "function": {
+                            "name": raw_fc["name"],
+                            "arguments": raw_fc["arguments"],
+                        },
+                    }
+                ]
+
+            outputs.append(output_dict)
+
+        cost = 0.0
+        self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
+        return outputs
+
+    def _query(
+        self, messages: list[dict[str, str]], n: int | None = None, temperature: float | None = None
+    ) -> list[dict]:
+        if n is None or n <= 1:
+            return self._single_query(messages, temperature=temperature)
+        outputs: list[dict] = []
+        for _ in range(n):
+            outputs.extend(self._single_query(messages))
+        return outputs
+
+    def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
+        messages = self._history_to_messages(history)
+
+        def retry_warning(retry_state: RetryCallState):
+            exception_info = ""
+            if retry_state.outcome is not None and retry_state.outcome.exception() is not None:
+                exc = retry_state.outcome.exception()
+                exception_info = f" due to {exc.__class__.__name__}: {str(exc)}"
+            self.logger.warning(
+                f"Retrying vLLM query: attempt {retry_state.attempt_number} "
+                f"(slept for {retry_state.idle_for:.2f}s){exception_info}"
+            )
+
+        for attempt in Retrying(
+            stop=stop_after_attempt(self.cfg.retry.retries),
+            wait=wait_random_exponential(min=self.cfg.retry.min_wait, max=self.cfg.retry.max_wait),
+            reraise=True,
+            retry=retry_if_not_exception_type(
+                (
+                    ContextWindowExceededError,
+                    CostLimitExceededError,
+                    RuntimeError,
+                    TypeError,
+                    ContentPolicyViolationError,
+                    ModelConfigurationError,
+                )
+            ),
+            before_sleep=retry_warning,
+        ):
+            with attempt:
+                result = self._query(messages, n=n, temperature=temperature)
+
+        if n is None or n == 1:
+            return result[0]
+        return result
+
+    def _history_to_messages(self, history: History) -> list[dict[str, str]]:
+        history_copy = copy.deepcopy(history)
+
+        def get_role(history_item: HistoryItem) -> str:
+            if history_item["role"] == "system":
+                return "user" if self.cfg.convert_system_to_user else "system"
+            return history_item["role"]
+
+        messages: list[dict[str, str]] = []
+        for history_item in history_copy:
+            role = get_role(history_item)
+            if role == "tool":
+                msg = {
+                    "role": role,
+                    "content": history_item["content"],
+                    "tool_call_id": history_item["tool_call_ids"][0],  # type: ignore
+                }
+            elif (tool_calls := history_item.get("tool_calls")) is not None:
+                msg = {
+                    "role": role,
+                    "content": history_item["content"],
+                    "tool_calls": tool_calls,
+                }
+            else:
+                msg = {"role": role, "content": history_item["content"]}
+
+            if "cache_control" in history_item:
+                msg["cache_control"] = history_item["cache_control"]
+            messages.append(msg)
+
+        n_cache = str(messages).count("cache_control")
+        self.logger.debug(f"n_cache_control: {n_cache}")
+        return messages
 
 
 
