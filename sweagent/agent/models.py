@@ -1011,7 +1011,6 @@ class VLLMModel(AbstractModel):
             reraise=True,
             retry=retry_if_not_exception_type(
                 (
-                    ContextWindowExceededError,
                     CostLimitExceededError,
                     RuntimeError,
                     TypeError,
